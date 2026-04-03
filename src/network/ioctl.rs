@@ -458,7 +458,6 @@ pub fn set_ipv4_address(name: &str, addr: &str) -> Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| Error::Network(format!("Failed to create socket: {}", e)))?;
 
-    // Parse address with optional CIDR notation
     let (ip_str, prefix_len) = if let Some(slash_pos) = addr.find('/') {
         let ip = &addr[..slash_pos];
         let prefix: u8 = addr[slash_pos + 1..]
@@ -473,30 +472,50 @@ pub fn set_ipv4_address(name: &str, addr: &str) -> Result<()> {
         .parse()
         .map_err(|_| Error::Network(format!("Invalid IPv4 address: {}", ip_str)))?;
 
+    let netmask: u32 = match prefix_len {
+        Some(p) if p == 0 => 0,
+        Some(p) => !0u32 << (32 - p),
+        None => !0u32, // /32 default
+    };
+
+    // Use ifaliasreq + SIOCAIFADDR — sets addr/mask/broadcast atomically,
+    // works on interfaces that are not yet up
     #[repr(C)]
-    struct IfReqAddr {
-        ifr_name: [libc::c_char; libc::IF_NAMESIZE],
-        ifr_addr: libc::sockaddr_in,
+    struct IfAliasReq {
+        ifra_name:      [libc::c_char; libc::IF_NAMESIZE],
+        ifra_addr:      libc::sockaddr_in,
+        ifra_broadaddr: libc::sockaddr_in,
+        ifra_mask:      libc::sockaddr_in,
     }
 
-    let mut req: IfReqAddr = unsafe { std::mem::zeroed() };
+    let mut req: IfAliasReq = unsafe { std::mem::zeroed() };
 
     let name_cstr = CString::new(name)
         .map_err(|e| Error::Network(format!("Invalid interface name: {}", e)))?;
     let name_bytes = name_cstr.as_bytes_with_nul();
-    req.ifr_name[..name_bytes.len()].copy_from_slice(unsafe {
+    req.ifra_name[..name_bytes.len()].copy_from_slice(unsafe {
         std::slice::from_raw_parts(name_bytes.as_ptr() as *const i8, name_bytes.len())
     });
 
-    // Set up sockaddr_in
-    req.ifr_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-    req.ifr_addr.sin_family = libc::AF_INET as u8;
-    req.ifr_addr.sin_addr.s_addr = u32::from_be_bytes(ip.octets()).to_be();
+    let sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
 
-    // SIOCSIFADDR ioctl
-    const SIOCSIFADDR: libc::c_ulong = 0x8020690c;
+    req.ifra_addr.sin_len    = sin_len;
+    req.ifra_addr.sin_family = libc::AF_INET as u8;
+    req.ifra_addr.sin_addr.s_addr = u32::from(ip).to_be();
 
-    let result = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCSIFADDR, &req) };
+    req.ifra_mask.sin_len    = sin_len;
+    req.ifra_mask.sin_family = libc::AF_INET as u8;
+    req.ifra_mask.sin_addr.s_addr = netmask.to_be();
+
+    // Broadcast = addr | ~mask
+    let broadcast = u32::from(ip) | !netmask;
+    req.ifra_broadaddr.sin_len    = sin_len;
+    req.ifra_broadaddr.sin_family = libc::AF_INET as u8;
+    req.ifra_broadaddr.sin_addr.s_addr = broadcast.to_be();
+
+    const SIOCAIFADDR: libc::c_ulong = 0x8040691a;
+
+    let result = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCAIFADDR, &req) };
 
     if result < 0 {
         return Err(Error::Network(format!(
@@ -505,38 +524,8 @@ pub fn set_ipv4_address(name: &str, addr: &str) -> Result<()> {
         )));
     }
 
-    // Set netmask if prefix length was specified
-    if let Some(prefix) = prefix_len {
-        let netmask = if prefix == 0 {
-            0u32
-        } else {
-            !0u32 << (32 - prefix)
-        };
-
-        let mut mask_req: IfReqAddr = unsafe { std::mem::zeroed() };
-        mask_req.ifr_name[..name_bytes.len()].copy_from_slice(unsafe {
-            std::slice::from_raw_parts(name_bytes.as_ptr() as *const i8, name_bytes.len())
-        });
-        mask_req.ifr_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-        mask_req.ifr_addr.sin_family = libc::AF_INET as u8;
-        mask_req.ifr_addr.sin_addr.s_addr = netmask.to_be();
-
-        // SIOCSIFNETMASK ioctl
-        const SIOCSIFNETMASK: libc::c_ulong = 0x80206916;
-
-        let result = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCSIFNETMASK, &mask_req) };
-
-        if result < 0 {
-            return Err(Error::Network(format!(
-                "Failed to set netmask: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-
     Ok(())
 }
-
 /// List all bridge interfaces on the system
 ///
 /// Uses if_nameindex(3) and filters for interfaces matching "bridge*" pattern
