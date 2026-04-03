@@ -32,11 +32,9 @@ fn copy_ifname(dest: &mut [libc::c_char; libc::IF_NAMESIZE], name: &str) -> Resu
 pub fn create_interface(iftype: &str, name: Option<&str>) -> Result<String> {
     use std::net::UdpSocket;
 
-    // Create a socket for ioctl operations
     let sock = UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| Error::Network(format!("Failed to create socket: {}", e)))?;
 
-    // SIOCIFCREATE structure for FreeBSD
     #[repr(C)]
     struct IfReq {
         ifr_name: [libc::c_char; libc::IF_NAMESIZE],
@@ -45,28 +43,18 @@ pub fn create_interface(iftype: &str, name: Option<&str>) -> Result<String> {
 
     let mut req: IfReq = unsafe { std::mem::zeroed() };
 
-    // Set interface type
+    // Always put the TYPE in ifr_name, never the desired custom name
     let type_cstr = CString::new(iftype)
         .map_err(|e| Error::Network(format!("Invalid interface type: {}", e)))?;
+    let type_bytes = type_cstr.as_bytes_with_nul();
+    req.ifr_name[..type_bytes.len()].copy_from_slice(unsafe {
+        std::slice::from_raw_parts(type_bytes.as_ptr() as *const i8, type_bytes.len())
+    });
 
-    if let Some(n) = name {
-        let name_cstr = CString::new(n)
-            .map_err(|e| Error::Network(format!("Invalid interface name: {}", e)))?;
-        let name_bytes = name_cstr.as_bytes_with_nul();
-        req.ifr_name[..name_bytes.len()].copy_from_slice(unsafe {
-            std::slice::from_raw_parts(name_bytes.as_ptr() as *const i8, name_bytes.len())
-        });
-    } else {
-        let type_bytes = type_cstr.as_bytes_with_nul();
-        req.ifr_name[..type_bytes.len()].copy_from_slice(unsafe {
-            std::slice::from_raw_parts(type_bytes.as_ptr() as *const i8, type_bytes.len())
-        });
-    }
+    // SIOCIFCREATE2 — kernel writes the auto-assigned name back into ifr_name
+    const SIOCIFCREATE2: libc::c_ulong = 0xc020697b;
 
-    // SIOCIFCREATE ioctl
-    const SIOCIFCREATE: libc::c_ulong = 0xc020697a;
-
-    let result = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCIFCREATE, &mut req) };
+    let result = unsafe { libc::ioctl(sock.as_raw_fd(), SIOCIFCREATE2, &mut req) };
 
     if result < 0 {
         return Err(Error::Network(format!(
@@ -75,19 +63,19 @@ pub fn create_interface(iftype: &str, name: Option<&str>) -> Result<String> {
         )));
     }
 
-    // Extract the created interface name
-    let name_len = req
-        .ifr_name
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(libc::IF_NAMESIZE);
-    let name_bytes: Vec<u8> = req.ifr_name[..name_len]
-        .iter()
-        .map(|&c| c as u8)
-        .collect();
+    // Extract the auto-assigned name the kernel gave us (e.g., "bridge0")
+    let name_len = req.ifr_name.iter().position(|&c| c == 0).unwrap_or(libc::IF_NAMESIZE);
+    let name_bytes: Vec<u8> = req.ifr_name[..name_len].iter().map(|&c| c as u8).collect();
+    let created_name = String::from_utf8(name_bytes)
+        .map_err(|e| Error::Network(format!("Invalid interface name: {}", e)))?;
 
-    String::from_utf8(name_bytes)
-        .map_err(|e| Error::Network(format!("Invalid interface name: {}", e)))
+    // If a custom name was requested, rename the auto-assigned one
+    if let Some(desired_name) = name {
+        rename_interface(&created_name, desired_name)?;
+        return Ok(desired_name.to_string());
+    }
+
+    Ok(created_name)
 }
 
 /// Destroy a network interface
